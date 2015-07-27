@@ -1,0 +1,10 @@
+[Unit]
+Description=User Mode Touch Driver for RPI_TOUCH
+After=syslog.service
+
+[Service]
+ExecStart=-/usr/local/bin/rpi_touch_driver -d
+Type=forking
+
+[Install]
+WantedBy=multi-user.target

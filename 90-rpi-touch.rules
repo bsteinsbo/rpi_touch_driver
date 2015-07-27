@@ -1,0 +1,1 @@
+ACTION=="add",ATTRS{idVendor}=="0eef", ATTRS{idProduct}=="0005", SUBSYSTEM=="hidraw", RUN="/usr/local/bin/rpi_touch_driver /dev/$kernel"
