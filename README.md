@@ -51,6 +51,9 @@ nothing RPi-specific about it.
 To use:
 * % make && sudo make install
 * Unplug and re-plug touch USB connector
+* (not tested) If calibration is necessary, install 99-rpi-touch.conf to /etc/X11/xorg.conf.d,
+calibrate using whatever calibration program you fancy, uncomment the calibration option line, and replace the calibration constants in 99-rpi-touch.conf
+
 
 Copyright (c) 2015 Bjarne Steinsbo
 
