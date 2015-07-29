@@ -50,7 +50,7 @@ nothing RPi-specific about it.
 
 To use:
 * % make && sudo make install
-* Unplug and re-plug touch USB connector
+* sudo make systemd-install (only if your system uses systemd, otherwise you must find your own way to start the daemon)
 * (not tested) If calibration is necessary, install 99-rpi-touch.conf to /etc/X11/xorg.conf.d,
 calibrate using whatever calibration program you fancy, uncomment the calibration option line, and replace the calibration constants in 99-rpi-touch.conf
 
