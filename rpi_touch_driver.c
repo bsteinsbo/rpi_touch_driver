@@ -92,8 +92,14 @@ int send_uevent(int fd, __u16 type, __u16 code, __s32 value)
 		case ABS_MT_TOUCH_MAJOR:
 			strcpy(ccode, "ABS_MT_TOUCH_MAJOR");
 			break;
+		case ABS_X:
+			strcpy(ccode, "ABS_X");
+			break;
 		case ABS_MT_POSITION_X:
 			strcpy(ccode, "ABS_MT_POSITION_X");
+			break;
+		case ABS_Y:
+			strcpy(ccode, "ABS_Y");
 			break;
 		case ABS_MT_POSITION_Y:
 			strcpy(ccode, "ABS_MT_POSITION_Y");
@@ -134,36 +140,43 @@ int main(int argc, char **argv)
 
 	if (argc != 2)
 		die("Usage: rpi_touch_driver -d|usbraw-device");
+	openlog("rpi_touch_driver", LOG_NOWAIT, LOG_DAEMON);
 	if (strlen(argv[1]) > 1 && strcmp(argv[1], "-d") != 0) {
 		/* Send device name to daemon and then exit */
-		fifo_fd = open("/var/run/.rpi_touch_driver.fifo", O_WRONLY | O_NONBLOCK);
-		if ((fifo_fd >= 0) && (write(fifo_fd, argv[1], strlen(argv[1]) > 0)))
+		fifo_fd = open("/var/run/rpi_touch_driver.fifo", O_WRONLY | O_NONBLOCK);
+		if ((fifo_fd >= 0) && (write(fifo_fd, argv[1], strlen(argv[1]) + 1) > 0)) {
+			close(fifo_fd);
 			exit(0);
+		}
 		die("Failed to write to fifo");
 	}
 	/* This is the daemon.. */
 
 	/* Create fifo */
-	if (mkfifo("/var/run/.rpi_touch_driver.fifo", 0600) && (errno != EEXIST))
+	if (mkfifo("/var/run/rpi_touch_driver.fifo", 0600) && (errno != EEXIST))
 		die("Failed to create fifo");
 
 	/* Syslog */
-	openlog("rpi_touch_driver", LOG_NOWAIT, LOG_DAEMON);
 
 	/* Daemonize */
 	if (daemon(0, 0))
 		die("error: daemonize\n");
 
 	while (1) {
+		char *p = devname;
+
 		/* Wait for device attach */
-		fifo_fd = open("/var/run/.rpi_touch_driver.fifo", O_RDONLY);
+		syslog(LOG_INFO, "Wait for plug event");
+		fifo_fd = open("/var/run/rpi_touch_driver.fifo", O_RDONLY);
 		if (fifo_fd < 0)
 			die("error: open fifo");
-		numc = read(fifo_fd, devname, 1023);
-		if (numc <= 0)
+		while (numc = read(fifo_fd, p, 1023) > 0) {
+			p += numc;
+		}
+		if (numc < 0)
 			die("Failed to read fifo");
 		close(fifo_fd);
-		devname[numc] = 0;
+		syslog(LOG_INFO, "Starting uinput for usb raw device %s", devname);
 
 		/* Iniialize uinput */
 		memset(&device, 0, sizeof(device));
@@ -172,8 +185,12 @@ int main(int argc, char **argv)
 		device.id.vendor = 1;
 		device.id.product = 1;
 		device.id.version = 1;
+		device.absmax[ABS_X] = 800;
+		device.absmax[ABS_Y] = 480;
 		device.absmax[ABS_MT_POSITION_X] = 800;
 		device.absmax[ABS_MT_POSITION_Y] = 480;
+		device.absmax[ABS_MT_SLOT] = 5;
+		device.absmax[ABS_MT_TRACKING_ID] = 5;
 	
 		uinput_fd = open("/dev/input/uinput", O_WRONLY | O_NONBLOCK);
 		if (uinput_fd < 0) {
@@ -185,11 +202,20 @@ int main(int argc, char **argv)
 		if (write(uinput_fd, &device, sizeof(device)) != sizeof(device))
 			die("error: setup device");
 
+		if (ioctl(uinput_fd, UI_SET_EVBIT, EV_KEY) < 0)
+			die("error: evbit key\n");
+
 		if (ioctl(uinput_fd, UI_SET_EVBIT, EV_SYN) < 0)
 			die("error: evbit syn\n");
 
 		if (ioctl(uinput_fd, UI_SET_EVBIT, EV_ABS) < 0)
 			die("error: evbit abs\n");
+
+		if (ioctl(uinput_fd, UI_SET_ABSBIT, ABS_X) < 0)
+			die("error: abs x\n");
+
+		if (ioctl(uinput_fd, UI_SET_ABSBIT, ABS_Y) < 0)
+			die("error: abs y\n");
 
 		if (ioctl(uinput_fd, UI_SET_ABSBIT, ABS_MT_SLOT) < 0)
 			die("error: abs slot\n");
@@ -198,10 +224,13 @@ int main(int argc, char **argv)
 			die("error: abs track id\n");
 
 		if (ioctl(uinput_fd, UI_SET_ABSBIT, ABS_MT_POSITION_X) < 0)
-			die("error: abs x\n");
+			die("error: abs mt x\n");
 
 		if (ioctl(uinput_fd, UI_SET_ABSBIT, ABS_MT_POSITION_Y) < 0)
-			die("error: abs y\n");
+			die("error: abs mt y\n");
+
+		if (ioctl(uinput_fd, UI_SET_KEYBIT, BTN_TOUCH) < 0)
+			die("error: evbit touch\n");
 
 		if (ioctl(uinput_fd, UI_DEV_CREATE) < 0)
 			die("error: create\n");
@@ -217,7 +246,6 @@ int main(int argc, char **argv)
 			int x[5];
 			int y[5];
 			int i;
-			int need_syn;
 			int n = read(usbraw_fd, data, sizeof(data));
 			if (n < 0)
 				break; /* Unplug? */
@@ -237,24 +265,29 @@ int main(int argc, char **argv)
 			}
 
 			/* Send input events */
-			need_syn = 0;
+			for (i = 0; i < 5; i++) {
+				if (state[i]) {
+					send_uevent(uinput_fd, EV_ABS, ABS_X, x[i]);
+					send_uevent(uinput_fd, EV_ABS, ABS_Y, y[i]);
+					send_uevent(uinput_fd, EV_KEY, BTN_TOUCH, 1);
+					break;
+				}
+			}
+			if (i == 5)
+				send_uevent(uinput_fd, EV_KEY, BTN_TOUCH, 0);
 			for (i = 0; i < 5; i++) {
 				if (state[i]) {
 					send_uevent(uinput_fd, EV_ABS, ABS_MT_SLOT, i);
 					send_uevent(uinput_fd, EV_ABS, ABS_MT_TRACKING_ID, i);
 					send_uevent(uinput_fd, EV_ABS, ABS_MT_POSITION_X, x[i]);
 					send_uevent(uinput_fd, EV_ABS, ABS_MT_POSITION_Y, y[i]);
-					need_syn = 1;
 				} else if (prev_state[i]) {
 					send_uevent(uinput_fd, EV_ABS, ABS_MT_SLOT, i);
 					send_uevent(uinput_fd, EV_ABS, ABS_MT_TRACKING_ID, -1);
-					need_syn = 1;
 				}
 				prev_state[i] = state[i];
 			}
-			if (need_syn) {
-				send_uevent(uinput_fd, EV_SYN, SYN_MT_REPORT, 0);
-			}
+			send_uevent(uinput_fd, EV_SYN, SYN_MT_REPORT, 0);
 		}
 		close(usbraw_fd);
 		ioctl(uinput_fd, UI_DEV_DESTROY);
