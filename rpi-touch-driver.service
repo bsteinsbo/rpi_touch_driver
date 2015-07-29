@@ -1,10 +1,8 @@
 [Unit]
 Description=User Mode Touch Driver for RPI_TOUCH
-After=syslog.service
-#Before=systemd-udev-trigger.service
 
 [Service]
-ExecStart=-/usr/local/bin/rpi_touch_driver -d
+ExecStart=-/usr/local/bin/rpi_touch_driver
 Type=forking
 
 [Install]
