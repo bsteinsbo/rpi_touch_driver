@@ -1,4 +1,4 @@
-/* User-mode multi-touch driver for 
+/* User-mode multi-touch driver for
  * usb 6-2: New USB device found, idVendor=0eef, idProduct=0005
  * usb 6-2: New USB device strings: Mfr=1, Product=2, SerialNumber=3
  * usb 6-2: Product: By ZH851
@@ -25,7 +25,7 @@
  *
  * This user mode driver decodes the touch events and injects them back into the
  * kernel using uinput.
- * 
+ *
  * Copyright (c) 2015 Bjarne Steinsbo
  *
  * Code and inspiration from http://thiemonge.org/getting-started-with-uinput
@@ -46,6 +46,8 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <errno.h>
+#include <libudev.h>
+#include <locale.h>
 #include <linux/input.h>
 #include <linux/uinput.h>
 #include <syslog.h>
@@ -58,10 +60,14 @@
         exit(EXIT_FAILURE); \
     } while(0)
 
+#define croak(str, ...) do { \
+        perror(str); \
+	syslog(LOG_ERR, str, ##__VA_ARGS__); \
+    } while(0)
+
 int uinput_fd;
 int usbraw_fd;
 int fifo_fd;
-char devname[1024];
 
 #define EVENT_DEBUG 0
 
@@ -130,169 +136,235 @@ int send_uevent(int fd, __u16 type, __u16 code, __s32 value)
 	return 0;
 }
 
-
-int main(int argc, char **argv)
+/* Open hidraw device and translate events until failure */
+void handle_hidraw_device(char *path)
 {
 	struct uinput_user_dev device;
 	unsigned char data[25];
-	int numc;
 	int prev_state[5];
 
-	if (argc != 2)
-		die("Usage: rpi_touch_driver -d|usbraw-device");
-	openlog("rpi_touch_driver", LOG_NOWAIT, LOG_DAEMON);
-	if (strlen(argv[1]) > 1 && strcmp(argv[1], "-d") != 0) {
-		/* Send device name to daemon and then exit */
-		fifo_fd = open("/var/run/rpi_touch_driver.fifo", O_WRONLY | O_NONBLOCK);
-		if ((fifo_fd >= 0) && (write(fifo_fd, argv[1], strlen(argv[1]) + 1) > 0)) {
-			close(fifo_fd);
-			exit(0);
-		}
-		die("Failed to write to fifo");
+	/* Open usbraw-device, communicated from udev through the fifo */
+	usbraw_fd = open(path, O_RDONLY);
+	if (usbraw_fd < 0) {
+		croak("error: open usbraw device : %s", path);
+		return;
 	}
-	/* This is the daemon.. */
+	syslog(LOG_INFO, "Starting : %s", path);
 
-	/* Create fifo */
-	if (mkfifo("/var/run/rpi_touch_driver.fifo", 0600) && (errno != EEXIST))
-		die("Failed to create fifo");
+	/* Iniialize uinput */
+	memset(&device, 0, sizeof(device));
+	strcpy(device.name, "RPI_TOUCH_uinput");
+	device.id.bustype = BUS_VIRTUAL;
+	device.id.vendor = 1;
+	device.id.product = 1;
+	device.id.version = 1;
+	device.absmax[ABS_X] = 800;
+	device.absmax[ABS_Y] = 480;
+	device.absmax[ABS_MT_POSITION_X] = 800;
+	device.absmax[ABS_MT_POSITION_Y] = 480;
+	device.absmax[ABS_MT_SLOT] = 5;
+	device.absmax[ABS_MT_TRACKING_ID] = 5;
 
-	/* Syslog */
+	uinput_fd = open("/dev/input/uinput", O_WRONLY | O_NONBLOCK);
+	if (uinput_fd < 0) {
+		uinput_fd = open("/dev/uinput", O_WRONLY | O_NONBLOCK);
+		if (uinput_fd < 0)
+			die("error: open uinput device");
+	}
 
-	/* Daemonize */
-	if (daemon(0, 0))
-		die("error: daemonize\n");
+	if (write(uinput_fd, &device, sizeof(device)) != sizeof(device))
+		die("error: setup device");
 
+	if (ioctl(uinput_fd, UI_SET_EVBIT, EV_KEY) < 0)
+		die("error: evbit key\n");
+
+	if (ioctl(uinput_fd, UI_SET_EVBIT, EV_SYN) < 0)
+		die("error: evbit syn\n");
+
+	if (ioctl(uinput_fd, UI_SET_EVBIT, EV_ABS) < 0)
+		die("error: evbit abs\n");
+
+	if (ioctl(uinput_fd, UI_SET_ABSBIT, ABS_X) < 0)
+		die("error: abs x\n");
+
+	if (ioctl(uinput_fd, UI_SET_ABSBIT, ABS_Y) < 0)
+		die("error: abs y\n");
+
+	if (ioctl(uinput_fd, UI_SET_ABSBIT, ABS_MT_SLOT) < 0)
+		die("error: abs slot\n");
+
+	if (ioctl(uinput_fd, UI_SET_ABSBIT, ABS_MT_TRACKING_ID) < 0)
+		die("error: abs track id\n");
+
+	if (ioctl(uinput_fd, UI_SET_ABSBIT, ABS_MT_POSITION_X) < 0)
+		die("error: abs mt x\n");
+
+	if (ioctl(uinput_fd, UI_SET_ABSBIT, ABS_MT_POSITION_Y) < 0)
+		die("error: abs mt y\n");
+
+	if (ioctl(uinput_fd, UI_SET_KEYBIT, BTN_TOUCH) < 0)
+		die("error: evbit touch\n");
+
+	if (ioctl(uinput_fd, UI_DEV_CREATE) < 0)
+		die("error: create\n");
+
+
+	/* Enter input loop */
 	while (1) {
-		char *p = devname;
-
-		/* Wait for device attach */
-		syslog(LOG_INFO, "Wait for plug event");
-		fifo_fd = open("/var/run/rpi_touch_driver.fifo", O_RDONLY);
-		if (fifo_fd < 0)
-			die("error: open fifo");
-		while (numc = read(fifo_fd, p, 1023) > 0) {
-			p += numc;
+		int state[5];
+		int x[5];
+		int y[5];
+		int i;
+		int n = read(usbraw_fd, data, sizeof(data));
+		if (n < 0)
+			break; /* Unplug? */
+		if (n != sizeof(data)) {
+			croak("Short input : %d\n", n);
+			continue;
 		}
-		if (numc < 0)
-			die("Failed to read fifo");
-		close(fifo_fd);
-		syslog(LOG_INFO, "Starting uinput for usb raw device %s", devname);
 
-		/* Iniialize uinput */
-		memset(&device, 0, sizeof(device));
-		strcpy(device.name, "RPI_TOUCH_uinput");
-		device.id.bustype = BUS_VIRTUAL;
-		device.id.vendor = 1;
-		device.id.product = 1;
-		device.id.version = 1;
-		device.absmax[ABS_X] = 800;
-		device.absmax[ABS_Y] = 480;
-		device.absmax[ABS_MT_POSITION_X] = 800;
-		device.absmax[ABS_MT_POSITION_Y] = 480;
-		device.absmax[ABS_MT_SLOT] = 5;
-		device.absmax[ABS_MT_TRACKING_ID] = 5;
-	
-		uinput_fd = open("/dev/input/uinput", O_WRONLY | O_NONBLOCK);
-		if (uinput_fd < 0) {
-			uinput_fd = open("/dev/uinput", O_WRONLY | O_NONBLOCK);
-			if (uinput_fd < 0)
-				die("error: open uinput device");
+		/* Decode raw data */
+		state[0] = (data[7] & 1) != 0;
+		x[0] = data[2] * 256 + data[3];
+		y[0] = data[4] * 256 + data[5];
+		for (i = 0; i < 4; i++) {
+			state[i + 1] = (data[7] & (2 << i)) != 0;
+			x[i + 1] = data[i * 2 + 8] * 256 + data[i * 2 + 9];
+			y[i + 1] = data[i * 2 + 10] * 256 + data[i * 2 + 11];
 		}
-	
-		if (write(uinput_fd, &device, sizeof(device)) != sizeof(device))
-			die("error: setup device");
 
-		if (ioctl(uinput_fd, UI_SET_EVBIT, EV_KEY) < 0)
-			die("error: evbit key\n");
-
-		if (ioctl(uinput_fd, UI_SET_EVBIT, EV_SYN) < 0)
-			die("error: evbit syn\n");
-
-		if (ioctl(uinput_fd, UI_SET_EVBIT, EV_ABS) < 0)
-			die("error: evbit abs\n");
-
-		if (ioctl(uinput_fd, UI_SET_ABSBIT, ABS_X) < 0)
-			die("error: abs x\n");
-
-		if (ioctl(uinput_fd, UI_SET_ABSBIT, ABS_Y) < 0)
-			die("error: abs y\n");
-
-		if (ioctl(uinput_fd, UI_SET_ABSBIT, ABS_MT_SLOT) < 0)
-			die("error: abs slot\n");
-
-		if (ioctl(uinput_fd, UI_SET_ABSBIT, ABS_MT_TRACKING_ID) < 0)
-			die("error: abs track id\n");
-
-		if (ioctl(uinput_fd, UI_SET_ABSBIT, ABS_MT_POSITION_X) < 0)
-			die("error: abs mt x\n");
-
-		if (ioctl(uinput_fd, UI_SET_ABSBIT, ABS_MT_POSITION_Y) < 0)
-			die("error: abs mt y\n");
-
-		if (ioctl(uinput_fd, UI_SET_KEYBIT, BTN_TOUCH) < 0)
-			die("error: evbit touch\n");
-
-		if (ioctl(uinput_fd, UI_DEV_CREATE) < 0)
-			die("error: create\n");
-
-		/* Open usbraw-device, communicated from udev through the fifo */
-		usbraw_fd = open(devname, O_RDONLY);
-		if (usbraw_fd < 0)
-			die("error: open usbraw device");
-
-		/* Enter input loop */
-		while (1) {
-			int state[5];
-			int x[5];
-			int y[5];
-			int i;
-			int n = read(usbraw_fd, data, sizeof(data));
-			if (n < 0)
-				break; /* Unplug? */
-			if (n != sizeof(data)) {
-				syslog(LOG_ERR, "Short input : %d\n", n);
-				continue;
+		/* Send input events */
+		for (i = 0; i < 5; i++) {
+			if (state[i]) {
+				send_uevent(uinput_fd, EV_ABS, ABS_X, x[i]);
+				send_uevent(uinput_fd, EV_ABS, ABS_Y, y[i]);
+				send_uevent(uinput_fd, EV_KEY, BTN_TOUCH, 1);
+				break;
 			}
-
-			/* Decode raw data */
-			state[0] = (data[7] & 1) != 0;
-			x[0] = data[2] * 256 + data[3];
-			y[0] = data[4] * 256 + data[5];
-			for (i = 0; i < 4; i++) {
-				state[i + 1] = (data[7] & (2 << i)) != 0;
-				x[i + 1] = data[i * 2 + 8] * 256 + data[i * 2 + 9];
-				y[i + 1] = data[i * 2 + 10] * 256 + data[i * 2 + 11];
-			}
-
-			/* Send input events */
-			for (i = 0; i < 5; i++) {
-				if (state[i]) {
-					send_uevent(uinput_fd, EV_ABS, ABS_X, x[i]);
-					send_uevent(uinput_fd, EV_ABS, ABS_Y, y[i]);
-					send_uevent(uinput_fd, EV_KEY, BTN_TOUCH, 1);
-					break;
-				}
-			}
-			if (i == 5)
-				send_uevent(uinput_fd, EV_KEY, BTN_TOUCH, 0);
-			for (i = 0; i < 5; i++) {
-				if (state[i]) {
-					send_uevent(uinput_fd, EV_ABS, ABS_MT_SLOT, i);
-					send_uevent(uinput_fd, EV_ABS, ABS_MT_TRACKING_ID, i);
-					send_uevent(uinput_fd, EV_ABS, ABS_MT_POSITION_X, x[i]);
-					send_uevent(uinput_fd, EV_ABS, ABS_MT_POSITION_Y, y[i]);
-				} else if (prev_state[i]) {
-					send_uevent(uinput_fd, EV_ABS, ABS_MT_SLOT, i);
-					send_uevent(uinput_fd, EV_ABS, ABS_MT_TRACKING_ID, -1);
-				}
-				prev_state[i] = state[i];
-			}
-			send_uevent(uinput_fd, EV_SYN, SYN_MT_REPORT, 0);
 		}
+		if (i == 5)
+			send_uevent(uinput_fd, EV_KEY, BTN_TOUCH, 0);
+		for (i = 0; i < 5; i++) {
+			if (state[i]) {
+				send_uevent(uinput_fd, EV_ABS, ABS_MT_SLOT, i);
+				send_uevent(uinput_fd, EV_ABS, ABS_MT_TRACKING_ID, i);
+				send_uevent(uinput_fd, EV_ABS, ABS_MT_POSITION_X, x[i]);
+				send_uevent(uinput_fd, EV_ABS, ABS_MT_POSITION_Y, y[i]);
+			} else if (prev_state[i]) {
+				send_uevent(uinput_fd, EV_ABS, ABS_MT_SLOT, i);
+				send_uevent(uinput_fd, EV_ABS, ABS_MT_TRACKING_ID, -1);
+			}
+			prev_state[i] = state[i];
+		}
+		send_uevent(uinput_fd, EV_SYN, SYN_MT_REPORT, 0);
+	}
+	if (usbraw_fd >= 0)
 		close(usbraw_fd);
+	if (uinput_fd >= 0) {
 		ioctl(uinput_fd, UI_DEV_DESTROY);
 		close(uinput_fd);
 	}
-	syslog(LOG_INFO, "Exiting\n");
+}
+
+char rpi_dev[64];
+char *find_rpi_touch()
+{
+	struct udev *udev;
+	struct udev_enumerate *enumerate;
+	struct udev_list_entry *devices, *dev_list_entry;
+	struct udev_device *dev;
+
+	/* Create the udev object */
+	udev = udev_new();
+	if (!udev)
+		die("Can't create udev");
+
+	/* Create a list of the devices in the 'hidraw' subsystem. */
+	enumerate = udev_enumerate_new(udev);
+	udev_enumerate_add_match_subsystem(enumerate, "hidraw");
+	udev_enumerate_scan_devices(enumerate);
+	devices = udev_enumerate_get_list_entry(enumerate);
+	/* For each item enumerated, print out its information.
+	   udev_list_entry_foreach is a macro which expands to
+	   a loop. The loop will be executed for each member in
+	   devices, setting dev_list_entry to a list entry
+	   which contains the device's path in /sys. */
+	udev_list_entry_foreach(dev_list_entry, devices) {
+		const char *path;
+
+		/* Get the filename of the /sys entry for the device
+		   and create a udev_device object (dev) representing it */
+		path = udev_list_entry_get_name(dev_list_entry);
+		dev = udev_device_new_from_syspath(udev, path);
+		strncpy(rpi_dev, udev_device_get_devnode(dev), 64);
+
+		/* The device pointed to by dev contains information about
+		   the hidraw device. In order to get information about the
+		   USB device, get the parent device with the
+		   subsystem/devtype pair of "usb"/"usb_device". This will
+		   be several levels up the tree, but the function will find
+		   it.*/
+		dev = udev_device_get_parent_with_subsystem_devtype(
+		       dev, "usb", "usb_device");
+		if (!dev)
+			die("Unable to find parent usb device.");
+
+		if (strcmp(udev_device_get_sysattr_value(dev, "idVendor"), "0eef")
+		 || strcmp(udev_device_get_sysattr_value(dev, "idProduct"), "0005")) {
+			rpi_dev[0] = 0;
+		}
+		udev_device_unref(dev);
+		if (rpi_dev[0] != 0)
+			break;
+	}
+	/* Free the enumerator object */
+	udev_enumerate_unref(enumerate);
+
+	udev_unref(udev);
+
+	return rpi_dev[0] == 0 ? NULL : rpi_dev;
+}
+
+int main(int argc, char **argv)
+{
+	int numc;
+	struct udev *udev;
+	struct udev_device *dev;
+	struct udev_monitor *mon;
+	char *devname;
+
+	/* Syslog */
+	openlog("rpi_touch_driver", LOG_NOWAIT, LOG_DAEMON);
+	/* Deamonize? */
+	if (!(argc > 1 && strlen(argv[1]) > 1 && !strcmp(argv[1], "-d"))) {
+		if (daemon(0, 0))
+			die("error: daemonize\n");
+	}
+
+	/* Create the udev object */
+	udev = udev_new();
+	if (!udev)
+		die("Can't create udev");
+
+	mon = udev_monitor_new_from_netlink(udev, "udev");
+	udev_monitor_filter_add_match_subsystem_devtype(mon, "hidraw", NULL);
+	udev_monitor_enable_receiving(mon);
+
+	devname = find_rpi_touch();
+	if (devname != NULL)
+		handle_hidraw_device(devname);
+
+	while (1)
+	{
+		/* Block waiting for an event */
+		dev = udev_monitor_receive_device(mon);
+		/* Release immediately */
+		udev_device_unref(dev);
+		devname = find_rpi_touch();
+		if (devname != NULL)
+			handle_hidraw_device(devname);
+	}
+	
+	udev_unref(udev);
 	return 0;
 }
